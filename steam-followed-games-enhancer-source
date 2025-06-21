@@ -1,0 +1,213 @@
+// ==UserScript==
+// @name         Steam Followed Games Enhancer
+// @namespace    http://tampermonkey.net/
+// @version      3.1
+// @description  Enhance Steam Followed Games with Steam pricing, historical low info, sorting, and per-game overlays.
+// @author       Big-Z
+// @match        https://steamcommunity.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      store.steampowered.com
+// @connect      isthereanydeal.com
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const BATCH_SIZE = 10;
+    const BATCH_DELAY = 1000;
+    let totalDiscountedValue = 0;
+    const gamesData = [];
+    let progressBar, progressText;
+    let sortMode = 'none';
+
+    const slugify = name => name.normalize("NFKD").replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-").toLowerCase();
+    const formatPrice = cents => cents === null ? 'No price info' : `$${(cents / 100).toFixed(2)}`;
+    const parseDate = dateStr => new Date(Date.parse(dateStr)) || new Date(0);
+
+    function fetchSteamData(appid, callback) {
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `https://store.steampowered.com/api/appdetails?appids=${appid}&cc=us&l=en`,
+            onload: function (res) {
+                try {
+                    const data = JSON.parse(res.responseText)[appid];
+                    if (!data.success || !data.data) return callback(null);
+                    const priceInfo = data.data.price_overview;
+                    callback({
+                        price: priceInfo?.initial ?? null,
+                        final: priceInfo?.final ?? null,
+                        discount: priceInfo?.discount_percent ?? 0,
+                        release: data.data.release_date?.date || 'Unknown'
+                    });
+                } catch {
+                    callback(null);
+                }
+            }
+        });
+    }
+
+    function fetchSteamHistoricalLow(gameName, callback) {
+        const slug = slugify(gameName);
+        GM_xmlhttpRequest({
+            method: "GET",
+            url: `https://isthereanydeal.com/game/${slug}/history/`,
+            onload: function (res) {
+                try {
+                    const doc = new DOMParser().parseFromString(res.responseText, "text/html");
+                    const rows = doc.querySelectorAll(".game-prices .history tbody tr");
+                    let lowest = null;
+                    rows.forEach(row => {
+                        const store = row.querySelector("td:nth-child(2)")?.textContent.trim();
+                        const priceStr = row.querySelector("td:nth-child(4)")?.textContent.trim();
+                        if (store === "Steam" && priceStr?.startsWith("$") ) {
+                            const price = parseFloat(priceStr.replace("$", ""));
+                            if (!isNaN(price)) {
+                                lowest = lowest === null ? price : Math.min(lowest, price);
+                            }
+                        }
+                    });
+                    callback(lowest ? `$${lowest.toFixed(2)}` : 'N/A');
+                } catch {
+                    callback('N/A');
+                }
+            }
+        });
+    }
+
+    function updateProgress(current, total) {
+        const percent = Math.round((current / total) * 100);
+        progressBar.value = percent;
+        progressText.textContent = `Progress: ${current}/${total} (${percent}%)`;
+    }
+
+    function renderSortedGames(container) {
+        const sorters = {
+            'price-asc': (a, b) => (a.final ?? Infinity) - (b.final ?? Infinity),
+            'price-desc': (a, b) => (b.final ?? 0) - (a.final ?? 0),
+            'discount-desc': (a, b) => b.discount - a.discount,
+            'date-desc': (a, b) => parseDate(b.release) - parseDate(a.release),
+            'none': () => 0
+        };
+        const sorted = [...gamesData].sort(sorters[sortMode]);
+        container.innerHTML = '';
+        sorted.forEach(({ node }) => container.appendChild(node));
+    }
+
+    function batchProcess(games, index = 0, container = null) {
+        if (index >= games.length) return;
+
+        const batch = games.slice(index, index + BATCH_SIZE);
+        let doneCount = 0;
+
+        batch.forEach(game => {
+            const titleEl = game.querySelector('.followed_game_name, .gameListRowItemName, .title');
+            const appLink = game.querySelector('a')?.href;
+            const appid = appLink?.match(/app\/(\d+)/)?.[1];
+            const name = titleEl?.textContent.trim();
+
+            if (!appid || !name) return checkDone();
+
+            fetchSteamData(appid, steamData => {
+                if (!steamData) return checkDone();
+                fetchSteamHistoricalLow(name, historicalLow => {
+                    const box = document.createElement('div');
+                    box.style = 'margin-top:6px;padding:6px;background:#222;color:white;font-size:13px;border-radius:6px;';
+                    const discountPrice = steamData.final && steamData.price ? `$${(steamData.final / 100).toFixed(2)}` : 'N/A';
+                    box.innerHTML = `
+                        <div><strong>Steam Price:</strong> ${formatPrice(steamData.price)}</div>
+                        <div><strong>Discount %:</strong> ${steamData.discount}%</div>
+                        <div><strong>Discount Price:</strong> ${discountPrice}</div>
+                        <div><strong>Steam Historical Low:</strong> ${historicalLow}</div>
+                        <div><strong>Release:</strong> ${steamData.release}</div>
+                    `;
+                    game.appendChild(box);
+
+                    if (steamData.discount > 0 && steamData.final < steamData.price) {
+                        game.style.border = '2px solid orange';
+                        totalDiscountedValue += steamData.final;
+                    } else {
+                        game.style.border = '2px solid green';
+                    }
+
+                    gamesData.push({
+                        name, appid,
+                        price: formatPrice(steamData.price),
+                        final: steamData.final,
+                        discount: steamData.discount,
+                        release: steamData.release,
+                        historical: historicalLow,
+                        node: game
+                    });
+
+                    checkDone();
+                });
+            });
+
+            function checkDone() {
+                doneCount++;
+                updateProgress(index + doneCount, games.length);
+                if (doneCount === batch.length) {
+                    renderSortedGames(container);
+                    setTimeout(() => batchProcess(games, index + BATCH_SIZE, container), BATCH_DELAY);
+                }
+            }
+        });
+    }
+
+    function addUI() {
+        const wrapper = document.createElement('div');
+        wrapper.style = 'position:fixed;top:10px;left:10px;z-index:999999;display:flex;gap:8px;';
+
+        const btn = document.createElement('button');
+        btn.textContent = '📊 Load Game Info';
+        btn.style = 'padding:10px;background:#171a21;color:white;border:none;border-radius:8px;';
+        btn.onclick = () => {
+            const games = [...document.querySelectorAll('.gameListRow.followed')];
+            const container = document.querySelector('.responsive_page_template_content') || document.body;
+            batchProcess(games, 0, container);
+        };
+
+        const dropdown = document.createElement('select');
+        dropdown.innerHTML = `
+            <option value="none">🔽 Sort: None</option>
+            <option value="price-asc">💰 Price: Low → High</option>
+            <option value="price-desc">💰 Price: High → Low</option>
+            <option value="discount-desc">📉 Discount: High → Low</option>
+            <option value="date-desc">🗓️ Release: New → Old</option>
+        `;
+        dropdown.style = 'padding:10px;border-radius:6px;';
+        dropdown.onchange = () => {
+            sortMode = dropdown.value;
+            const container = document.querySelector('.responsive_page_template_content') || document.body;
+            renderSortedGames(container);
+        };
+
+        wrapper.appendChild(btn);
+        wrapper.appendChild(dropdown);
+        document.body.appendChild(wrapper);
+
+        const barBox = document.createElement('div');
+        barBox.style = 'position:fixed;top:60px;left:10px;z-index:999999;background:#222;padding:10px;border-radius:8px;color:white;';
+
+        progressBar = document.createElement('progress');
+        progressBar.max = 100;
+        progressBar.value = 0;
+        progressBar.style = 'width: 300px; margin-bottom: 5px;';
+        barBox.appendChild(progressBar);
+
+        progressText = document.createElement('div');
+        progressText.textContent = 'Progress: 0/0 (0%)';
+        barBox.appendChild(progressText);
+
+        const totalDiv = document.createElement('div');
+        totalDiv.id = 'discounted-total';
+        totalDiv.textContent = 'Total Discounted Value: $0.00';
+        barBox.appendChild(totalDiv);
+
+        document.body.appendChild(barBox);
+    }
+
+    if (window.location.href.includes('/followedgames')) {
+        addUI();
+    }
+})();
